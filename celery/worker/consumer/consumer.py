@@ -317,7 +317,6 @@ class Consumer:
         return self._schedule_bucket_request(bucket)
 
     def _limit_post_eta(self, request, bucket, tokens):
-        self.qos.decrement_eventually()
         bucket.add((request, tokens))
         return self._schedule_bucket_request(bucket)
 
@@ -569,7 +568,7 @@ class Consumer:
         """Method called by the timer to apply a task with an ETA/countdown."""
         task_reserved(task)
         self.on_task_request(task)
-        self.qos.decrement_eventually()
+        # QoS decrement for ETA tasks is handled in WorkController._process_task
 
     def _message_report(self, body, message):
         return MESSAGE_REPORT.format(dump_body(message, body),

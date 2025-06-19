@@ -222,6 +222,8 @@ class WorkController:
     def _process_task(self, req):
         """Process task by sending it to the pool of workers."""
         try:
+            if req.eta:
+                self.consumer.qos.decrement_eventually()
             req.execute_using_pool(self.pool)
         except TaskRevokedError:
             try:

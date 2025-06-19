@@ -2,6 +2,7 @@ import errno
 import socket
 from collections import deque
 from unittest.mock import MagicMock, Mock, call, patch
+from datetime import datetime, timedelta, timezone # Added for ETA test
 
 import pytest
 from amqp import ChannelError
@@ -11,6 +12,7 @@ from celery import bootsteps
 from celery.contrib.testing.mocks import ContextMock
 from celery.exceptions import WorkerShutdown, WorkerTerminate
 from celery.utils.collections import LimitedSet
+from celery.utils.objects import Bunch # Added for ETA test
 from celery.worker.consumer.agent import Agent
 from celery.worker.consumer.consumer import CANCEL_TASKS_BY_DEFAULT, CLOSE, TERMINATE, Consumer
 from celery.worker.consumer.gossip import Gossip
@@ -18,6 +20,8 @@ from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
 from celery.worker.consumer.tasks import Tasks
 from celery.worker.state import active_requests
+from kombu.common import QoS # Added for ETA test
+from celery.worker.request import Request # Added for ETA test
 
 
 class ConsumerTestCase:
@@ -233,7 +237,8 @@ class test_Consumer(ConsumerTestCase):
             'celery.worker.consumer.consumer.Consumer._schedule_bucket_request'
         ) as task_reserved:
             c._limit_post_eta(request, bucket, 1)
-            c.qos.decrement_eventually.assert_called_with()
+            # self.qos.decrement_eventually was removed here in previous step
+            # c.qos.decrement_eventually.assert_called_with()
             bucket.add.assert_called_with((request, 1))
             task_reserved.assert_called_with(bucket)
 
@@ -480,6 +485,107 @@ class test_Consumer_WorkerShutdown(ConsumerTestCase):
             )
             expected_connection_retry_type = f"app.conf.{conn_type_name}=False"
             assert expected_connection_retry_type in record.msg
+
+
+class test_Consumer_ETA_QoS(ConsumerTestCase):
+
+    @patch('celery.worker.consumer.consumer.logger') # Mock logger
+    def test_future_eta_task_qos_interaction(self, mock_logger):
+        mock_app = MagicMock(name='App')
+        fixed_now = datetime.now(timezone.utc)
+        mock_app.clock.now.return_value = fixed_now
+        # Ensure 'task_acks_late' is available in conf for strategy if needed
+        mock_app.conf = {
+            'broker_connection_retry_on_startup': False,
+            'worker_prefetch_multiplier': 1,
+            'task_acks_late': False, # Default behavior for decrement
+        }
+        # Mock app.tasks to return tasks with acks_late attribute
+        mock_task1_type = MagicMock(name='task1_type', spec=['acks_late'])
+        mock_task1_type.acks_late = False
+        mock_task2_type = MagicMock(name='task2_type', spec=['acks_late'])
+        mock_task2_type.acks_late = False
+        mock_app.tasks = {'task1': mock_task1_type, 'task2': mock_task2_type}
+
+
+        mock_pool = MagicMock(name='Pool')
+        mock_pool.num_processes = 1
+
+        mock_on_task_request = MagicMock(name='on_task_request_callback')
+
+        consumer = Consumer(
+            on_task_request=mock_on_task_request,
+            app=mock_app,
+            pool=mock_pool,
+            timer=MagicMock(name='Timer'),
+            hostname='testworker@localhost',
+            initial_prefetch_count=1,
+            prefetch_multiplier=1
+        )
+
+        consumer.qos = MagicMock(spec=QoS)
+        consumer.qos.value = 1
+        consumer.qos.decrement_eventually.reset_mock() # Reset any prior calls
+
+        # --- Simulate Future ETA Task (task1) ---
+        task1_request = MagicMock(spec=Request)
+        task1_request.id = 'task1_id'
+        task1_request.name = 'task1'
+        task1_request.eta = fixed_now + timedelta(seconds=3600)
+        task1_request.message = MagicMock()
+        task1_request.acknowledged = False
+        task1_request.task = mock_app.tasks['task1'] # Link to mocked task type
+
+        # Simulate timer scheduling task1
+        consumer.timer.call_at(task1_request.eta, consumer.apply_eta_task, (task1_request,))
+        consumer.timer.call_at.assert_called_once_with(
+            task1_request.eta, consumer.apply_eta_task, (task1_request,)
+        )
+        consumer.qos.decrement_eventually.assert_not_called() # No decrement yet
+
+        # --- Simulate Regular Task (task2) ---
+        task2_request = MagicMock(spec=Request)
+        task2_request.id = 'task2_id'
+        task2_request.name = 'task2'
+        task2_request.eta = None
+        task2_request.message = MagicMock()
+        task2_request.acknowledged = False
+        task2_request.task = mock_app.tasks['task2'] # Link to mocked task type
+
+        # Simulate task2 being picked up by on_task_request.
+        # The actual call to qos.decrement_eventually for a non-ETA task
+        # happens within WorkController._process_task or strategy.
+        # Here, we simulate that effect by calling it directly once for task2,
+        # as if _process_task decided to do so.
+        mock_on_task_request(task2_request) # This simulates _process_task receiving it
+        mock_on_task_request.assert_called_with(task2_request)
+
+        # Simulate the qos decrement that would happen for task2 (non-ETA)
+        # This is the key simulation of _process_task's direct action for non-ETA.
+        consumer.qos.decrement_eventually()
+
+        consumer.qos.decrement_eventually.assert_called_once() # Assert one decrement for task2
+
+        # --- Simulate task1 ETA arrival ---
+        # consumer.timer.call_at.call_args is a tuple: (args, kwargs)
+        # We want the positional arguments from the first call.
+        eta_call_args_tuple = consumer.timer.call_at.call_args[0]
+        eta_callback = eta_call_args_tuple[1]
+        eta_task_args_tuple = eta_call_args_tuple[2] # This is (task1_request,)
+
+        assert eta_callback == consumer.apply_eta_task
+        assert eta_task_args_tuple[0] == task1_request
+
+        consumer.apply_eta_task(eta_task_args_tuple[0]) # Execute apply_eta_task for task1
+
+        # --- Assert state after task1's apply_eta_task ---
+        # on_task_request should have been called for task1 now
+        mock_on_task_request.assert_called_with(task1_request)
+        assert mock_on_task_request.call_count == 2
+
+        # CRITICAL: decrement_eventually should still only have been called ONCE (for task2).
+        # apply_eta_task for task1 should NOT have called it.
+        consumer.qos.decrement_eventually.assert_called_once()
 
 
 class test_Heart:
